@@ -1,8 +1,12 @@
 import http from "k6/http";
 
 export const options = {
-  vus: 10,        // virtual users
-  duration: "10s" // test time
+  vus: 10,
+  duration: "10s",
+  thresholds: {
+    http_req_failed: ["rate<0.05"],
+    http_req_duration: ["p(95)<1000"],
+  },
 };
 
 export default function () {

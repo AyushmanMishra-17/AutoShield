@@ -16,6 +16,7 @@ import React from "react";
 import "leaflet/dist/leaflet.css";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
+const socket = io(API_URL);
 
 const defaultSnapshot = {
   alerts: [],
@@ -42,42 +43,46 @@ const defaultSnapshot = {
 export default function Dashboard() {
   const [snapshot, setSnapshot] = useState(defaultSnapshot);
   const [trafficData, setTrafficData] = useState([]);
-  const [connectionStatus, setConnectionStatus] = useState("connecting");
 
-  useEffect(() => {
-    // Create socket connection with reconnection settings
-    const socket = io(API_URL, {
-      transports: ['websocket', 'polling'],
-      reconnection: true,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      reconnectionAttempts: Infinity
+  // Administrative action: the token is entered at action time rather than
+  // being bundled into the browser application.
+  const unblockIP = async (ip) => {
+    const token = window.prompt("Enter AutoShield admin token to unblock this IP:");
+    if (!token) return;
+
+    const response = await fetch(`${API_URL}/unblock`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ ip })
     });
 
-    const onUpdate = (res) => {
-      console.log("📥 Received update:", {
-        blockedCount: res.blockedIPs?.length || 0,
-        alertCount: res.alerts?.length || 0,
-        rps: res.metrics?.rps || 0
-      });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      window.alert(data.error || "Unable to unblock IP");
+    }
+  };
 
+  useEffect(() => {
+    const onUpdate = (res) => {
+      // 🔥 FIXED STATE MERGE (CRITICAL)
       setSnapshot(prev => ({
         ...prev,
-        alerts: res.alerts || prev.alerts,
-        blockedIPs: res.blockedIPs || prev.blockedIPs,
-        metrics: res.metrics || prev.metrics,
-        insights: res.insights || prev.insights
+        ...res,
+        blockedIPs: res.blockedIPs ?? prev.blockedIPs ?? [],
+        alerts: res.alerts ?? prev.alerts ?? []
       }));
 
-      // Update traffic graph
+      // 🔥 GRAPH ENGINE
       setTrafficData(prev => {
         const rps = res.metrics?.rps || 0;
         const anomalies = res.metrics?.anomalies || 0;
 
-        // Dynamic threshold (AI baseline)
-        const threshold = Math.max(20, rps * 0.6 + anomalies * 2);
+        const threshold = res.baseline?.threshold || 20;
 
-        const next = [
+        return [
           ...prev.slice(-30),
           {
             time: new Date().toLocaleTimeString(),
@@ -87,48 +92,17 @@ export default function Dashboard() {
             spike: rps > threshold ? rps : null
           }
         ];
-
-        return next;
       });
     };
 
-    const onConnect = () => {
-      console.log("✅ Connected to server");
-      setConnectionStatus("connected");
-    };
-
-    const onDisconnect = () => {
-      console.log("❌ Disconnected from server");
-      setConnectionStatus("disconnected");
-    };
-
-    const onReconnect = (attemptNumber) => {
-      console.log(`🔄 Reconnected after ${attemptNumber} attempts`);
-      setConnectionStatus("connected");
-    };
-
-    const onReconnecting = (attemptNumber) => {
-      console.log(`🔄 Reconnecting... attempt ${attemptNumber}`);
-      setConnectionStatus("reconnecting");
-    };
-
-    socket.on("connect", onConnect);
-    socket.on("disconnect", onDisconnect);
-    socket.on("reconnect", onReconnect);
-    socket.on("reconnecting", onReconnecting);
     socket.on("update", onUpdate);
 
     return () => {
-      socket.off("connect", onConnect);
-      socket.off("disconnect", onDisconnect);
-      socket.off("reconnect", onReconnect);
-      socket.off("reconnecting", onReconnecting);
       socket.off("update", onUpdate);
-      socket.disconnect();
     };
   }, []);
 
-  const { alerts, blockedIPs, metrics, insights } = snapshot;
+  const { alerts, blockedIPs, metrics, insights, baseline } = snapshot;
 
   const riskLabel = useMemo(() => {
     if (metrics.riskScore >= 85) return "Critical";
@@ -139,12 +113,6 @@ export default function Dashboard() {
 
   return (
     <main className="dashboard-shell">
-
-      {connectionStatus !== "connected" && (
-        <div className="attack-banner" style={{ background: "rgba(59, 130, 246, 0.2)", borderColor: "#3b82f6", color: "#dbeafe" }}>
-          {connectionStatus === "reconnecting" ? "🔄 Reconnecting to server..." : "⚠️ Disconnected - attempting to reconnect..."}
-        </div>
-      )}
 
       <section className="dashboard-header">
         <div>
@@ -191,29 +159,11 @@ export default function Dashboard() {
               <YAxis stroke="#94a3b8" />
               <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #334155" }} />
 
-              {/* RPS */}
-              <Area
-                dataKey="requests"
-                stroke="#38bdf8"
-                fill="url(#traffic)"
-                strokeWidth={2}
-              />
+              <Area dataKey="requests" stroke="#38bdf8" fill="url(#traffic)" strokeWidth={2} />
 
-              {/* Threshold */}
-              <Line
-                dataKey="threshold"
-                stroke="#f97316"
-                strokeDasharray="5 5"
-                dot={false}
-              />
+              <Line dataKey="threshold" stroke="#f97316" strokeDasharray="5 5" dot={false} />
 
-              {/* 🔥 SPIKE DETECTION */}
-              <Line
-                dataKey="spike"
-                stroke="#ef4444"
-                strokeWidth={3}
-                dot={false}
-              />
+              <Line dataKey="spike" stroke="#ef4444" strokeWidth={3} dot={false} />
             </AreaChart>
           </ResponsiveContainer>
         </div>
@@ -245,7 +195,7 @@ export default function Dashboard() {
 
       <section className="content-grid lower-grid">
         <AlertFeed alerts={alerts} />
-        <BlockedLog blockedIPs={blockedIPs} />
+        <BlockedLog blockedIPs={blockedIPs} unblockIP={unblockIP} />
       </section>
     </main>
   );
@@ -270,8 +220,8 @@ function AlertFeed({ alerts }) {
 
       <div className="event-list">
         {alerts.length === 0 && <p className="empty-state">No active anomalies detected.</p>}
-        {alerts.slice(0, 8).map((alert, index) => (
-          <article key={`${alert.ip}-${alert.timestamp}-${index}`}>
+        {alerts.slice(0, 8).map((alert) => (
+          <article key={alert.ip + alert.timestamp}>
             <div>
               <strong>{alert.attackType}</strong>
               <span>{alert.ip} | {alert.country}</span>
@@ -286,7 +236,7 @@ function AlertFeed({ alerts }) {
   );
 }
 
-function BlockedLog({ blockedIPs }) {
+function BlockedLog({ blockedIPs = [], unblockIP }) {
   return (
     <div className="card table-card">
       <p className="section-kicker">Blocked IP Log</p>
@@ -294,13 +244,21 @@ function BlockedLog({ blockedIPs }) {
 
       <div className="event-list compact">
         {blockedIPs.length === 0 && <p className="empty-state">No IPs blocked yet.</p>}
-        {blockedIPs.slice(0, 8).map((entry, index) => (
-          <article key={`${entry.ip}-${entry.timestamp}-${index}`}>
+
+        {blockedIPs.slice(0, 8).map((entry) => (
+          <article key={entry.ip + entry.timestamp}>
             <div>
               <strong>{entry.ip}</strong>
-              <small>{entry.reason}</small>
+              <span>{entry.reason || "Blocked"}</span>
             </div>
-            <small>{new Date(entry.timestamp).toLocaleTimeString()}</small>
+
+            <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+              <small>{new Date(entry.timestamp).toLocaleTimeString()}</small>
+
+              <button onClick={() => unblockIP(entry.ip)}>
+                Unblock
+              </button>
+            </div>
           </article>
         ))}
       </div>
